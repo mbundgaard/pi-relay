@@ -29,7 +29,7 @@ relay_status
 relay_disconnect
 ```
 
-For the simple flow, just ask: “start the relay”. The agent should use `relay_prepare`. It starts the local relay, auto-detects an already-running ngrok tunnel if possible, and gives you the exact line to paste into the other Pi session. It does not start ngrok itself.
+For the simple flow, just ask: “start the relay”. The agent should use `relay_start` or `relay_prepare`. It starts the local relay, starts ngrok automatically, and returns one pasteable `/relay_accept ...` line for the other Pi session.
 
 Slash commands with the same names except `relay_prepare` are also registered for manual use, but they are optional.
 

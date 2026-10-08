@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import { mkdir, readFile, writeFile, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
@@ -16,6 +17,8 @@ const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const PEER_PATH = path.join(STATE_DIR, "peer.json");
 const MESSAGES_PATH = path.join(STATE_DIR, "messages.jsonl");
 const MAX_BODY_BYTES = 256 * 1024;
+const require = createRequire(import.meta.url);
+let ngrokStarted = false;
 
 type MessageType = "user_message" | "assistant_message" | "contact_card" | "ack" | "error";
 
@@ -383,31 +386,23 @@ async function sendToPeer(text: string) {
 	return { peer, message };
 }
 
+async function startNgrok(port: number): Promise<string | undefined> {
+	const existing = await detectNgrokUrl();
+	if (existing) return existing;
+	const ngrok = require("ngrok");
+	const url = await ngrok.connect({ addr: port });
+	ngrokStarted = true;
+	return typeof url === "string" ? url.replace(/\/$/, "") : undefined;
+}
+
 async function prepareRelay(url?: string) {
 	const started = await startServer();
-	const publicUrl = url?.trim() ? await setPublicUrl(url) : (await detectNgrokUrl()) ?? undefined;
-	if (publicUrl && !url?.trim()) await setPublicUrl(publicUrl);
-	if (!publicUrl) {
-		return {
-			ready: false,
-			text: [
-				`Local relay is ${started.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${started.port}.`,
-				"I still need your public ngrok URL.",
-				"Run this in another terminal:",
-				`ngrok http ${started.port}`,
-				"Then tell me: set relay URL to <the https ngrok URL> and show my relay details.",
-			].join("\n"),
-		};
-	}
+	const publicUrl = url?.trim() ? await setPublicUrl(url) : await startNgrok(started.port);
+	if (!publicUrl) throw new Error("Could not start ngrok or get public URL");
 	const invite = await createInvite(publicUrl);
 	return {
 		ready: true,
-		text: [
-			`Local relay is ${started.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${started.port}.`,
-			`Public URL: ${publicUrl}`,
-			"Paste this into the other Pi session:",
-			invite.acceptLine,
-		].join("\n"),
+		text: invite.acceptLine,
 		invite,
 	};
 }
@@ -431,6 +426,14 @@ export default function relayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (ngrokStarted) {
+			try {
+				await require("ngrok").kill();
+			} catch {
+				// ignore shutdown cleanup failures
+			}
+			ngrokStarted = false;
+		}
 		await stopServer();
 		currentContext = undefined;
 	});
@@ -459,7 +462,7 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "relay_prepare",
 		label: "Relay Prepare",
-		description: "Do the simple 'start relay' flow: start the local relay, auto-detect ngrok if it is already running, and return the exact line to paste into the other Pi. Does not start ngrok.",
+		description: "Start the relay end-to-end: open the local relay, start ngrok automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Optional public ngrok URL if already known" })),
 		}),
@@ -473,16 +476,12 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "relay_start",
 		label: "Relay Start",
-		description: "Start the local pi-relay HTTP server on 127.0.0.1. Does not start ngrok.",
-		parameters: Type.Object({
-			port: Type.Optional(Type.Number({ description: "Local port, defaults to 8787" })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		description: "Start the relay end-to-end: open the local relay, start ngrok automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			currentContext = ctx;
-			const port = params.port;
-			if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error("Invalid port");
-			const result = await startServer(port);
-			return toolText(`pi-relay ${result.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${result.port}`, result);
+			const result = await prepareRelay();
+			return toolText(result.text, result);
 		},
 	});
 
