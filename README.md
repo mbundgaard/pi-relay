@@ -2,7 +2,7 @@
 
 One-to-one async Pi-to-Pi relay implemented as a Pi extension.
 
-The extension does **not** start ngrok automatically. Loading it only registers commands.
+Loading the extension only registers tools. When you ask the agent to start the relay, it starts the local relay and opens a free Cloudflare quick tunnel automatically.
 
 ## Load
 
@@ -12,76 +12,40 @@ From this repo:
 pi --extension ./src/index.ts
 ```
 
-## Agent tools
+## Simple use
 
-The extension gives the agent tools so you can ask it naturally, e.g. “start relay”, “set my relay URL to …”, “send this to the other Pi”.
-
-Available tools:
+Ask the agent:
 
 ```text
-relay_prepare
+start relay
+```
+
+It should call `relay_start` and return exactly one line like:
+
+```text
+/relay_accept pi-relay://... 123456
+```
+
+Paste that line into the remote Pi session. That is the pairing prompt.
+
+On the remote side, ask its agent to start relay too if needed, then paste the line. The remote side sends its return contact card back automatically.
+
+Then either side can ask its agent to send something to the other Pi.
+
+## Agent tools
+
+```text
 relay_start
-relay_set_url
-relay_show_details
+relay_prepare
 relay_accept
 relay_send
 relay_status
 relay_disconnect
+relay_set_url
+relay_show_details
 ```
 
-For the simple flow, just ask: “start the relay”. The agent should use `relay_start` or `relay_prepare`. It starts the local relay, starts ngrok automatically, and returns one pasteable `/relay_accept ...` line for the other Pi session.
-
-Slash commands with the same names except `relay_prepare` are also registered for manual use, but they are optional.
-
-## Handshake
-
-On host A:
-
-```text
-/relay_start
-```
-
-In a separate shell:
-
-```bash
-ngrok http 8787
-```
-
-Back in Pi:
-
-```text
-/relay_set_url https://a.ngrok-free.app
-/relay_show_details
-```
-
-Copy the printed `/relay_accept ... 123456` line to host B.
-
-On host B:
-
-```text
-/relay_start
-```
-
-In a separate shell:
-
-```bash
-ngrok http 8787
-```
-
-Back in Pi:
-
-```text
-/relay_set_url https://b.ngrok-free.app
-/relay_accept pi-relay://... 123456
-```
-
-B stores A and sends B's return contact card to A. A verifies the 6-digit pairing code and stores B.
-
-Then either side can run:
-
-```text
-/relay_send Please inspect your repo and report back.
-```
+Slash commands with similar names are also registered for manual use, but normal use should be through agent tools.
 
 ## State
 

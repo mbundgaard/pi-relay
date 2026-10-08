@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { randomBytes } from "node:crypto";
-import { createRequire } from "node:module";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readFile, writeFile, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
@@ -17,8 +17,7 @@ const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const PEER_PATH = path.join(STATE_DIR, "peer.json");
 const MESSAGES_PATH = path.join(STATE_DIR, "messages.jsonl");
 const MAX_BODY_BYTES = 256 * 1024;
-const require = createRequire(import.meta.url);
-let ngrokStarted = false;
+let tunnelProcess: ChildProcess | undefined;
 
 type MessageType = "user_message" | "assistant_message" | "contact_card" | "ack" | "error";
 
@@ -123,7 +122,7 @@ function decodeCard(input: string): ContactCard {
 
 async function makeLocalCard(): Promise<ContactCard> {
 	const cfg = await getConfig();
-	if (!cfg.url) throw new Error("No public URL configured. Run /relay_set_url <ngrok-url> first.");
+	if (!cfg.url) throw new Error("No public URL configured. Start the relay first.");
 	return {
 		kind: "pi-relay-contact",
 		version: 1,
@@ -386,19 +385,61 @@ async function sendToPeer(text: string) {
 	return { peer, message };
 }
 
-async function startNgrok(port: number): Promise<string | undefined> {
-	const existing = await detectNgrokUrl();
-	if (existing) return existing;
-	const ngrok = require("ngrok");
-	const url = await ngrok.connect({ addr: port });
-	ngrokStarted = true;
-	return typeof url === "string" ? url.replace(/\/$/, "") : undefined;
+async function startCloudflareTunnel(port: number): Promise<string> {
+	if (tunnelProcess) {
+		const cfg = await getConfig();
+		if (cfg.url) return cfg.url;
+	}
+
+	return new Promise((resolve, reject) => {
+		const proc = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		tunnelProcess = proc;
+		let settled = false;
+		let output = "";
+		const timeout = setTimeout(() => {
+			if (!settled) {
+				settled = true;
+				proc.kill();
+				reject(new Error("Timed out waiting for Cloudflare tunnel URL"));
+			}
+		}, 30_000);
+
+		const onData = (chunk: Buffer) => {
+			const text = chunk.toString("utf8");
+			output += text;
+			const match = output.match(/https:\/\/[^\s|]+\.trycloudflare\.com/);
+			if (match && !settled) {
+				settled = true;
+				clearTimeout(timeout);
+				resolve(match[0].replace(/\/$/, ""));
+			}
+		};
+
+		proc.stdout.on("data", onData);
+		proc.stderr.on("data", onData);
+		proc.on("error", (err) => {
+			if (!settled) {
+				settled = true;
+				clearTimeout(timeout);
+				reject(err);
+			}
+		});
+		proc.on("exit", (code) => {
+			if (!settled) {
+				settled = true;
+				clearTimeout(timeout);
+				reject(new Error(`Cloudflare tunnel exited (${code}): ${output.slice(-1000)}`));
+			}
+		});
+	});
 }
 
 async function prepareRelay(url?: string) {
 	const started = await startServer();
-	const publicUrl = url?.trim() ? await setPublicUrl(url) : await startNgrok(started.port);
-	if (!publicUrl) throw new Error("Could not start ngrok or get public URL");
+	const publicUrl = url?.trim() ? await setPublicUrl(url) : await startCloudflareTunnel(started.port);
+	if (!publicUrl) throw new Error("Could not start public tunnel or get public URL");
 	const invite = await createInvite(publicUrl);
 	return {
 		ready: true,
@@ -426,13 +467,13 @@ export default function relayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (ngrokStarted) {
+		if (tunnelProcess) {
 			try {
-				await require("ngrok").kill();
+				tunnelProcess.kill();
 			} catch {
 				// ignore shutdown cleanup failures
 			}
-			ngrokStarted = false;
+			tunnelProcess = undefined;
 		}
 		await stopServer();
 		currentContext = undefined;
@@ -462,9 +503,9 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "relay_prepare",
 		label: "Relay Prepare",
-		description: "Start the relay end-to-end: open the local relay, start ngrok automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
+		description: "Start the relay end-to-end: open the local relay, start a free public tunnel automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
 		parameters: Type.Object({
-			url: Type.Optional(Type.String({ description: "Optional public ngrok URL if already known" })),
+			url: Type.Optional(Type.String({ description: "Optional public tunnel URL if already known" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			currentContext = ctx;
@@ -476,7 +517,7 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "relay_start",
 		label: "Relay Start",
-		description: "Start the relay end-to-end: open the local relay, start ngrok automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
+		description: "Start the relay end-to-end: open the local relay, start a free public tunnel automatically, and return exactly one pasteable relay_accept line for the remote Pi.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			currentContext = ctx;
@@ -488,9 +529,9 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "relay_set_url",
 		label: "Relay Set URL",
-		description: "Set this relay's public ngrok URL after the user has started ngrok manually.",
+		description: "Set this relay's public tunnel URL manually.",
 		parameters: Type.Object({
-			url: Type.String({ description: "Public URL, for example https://abc123.ngrok-free.app" }),
+			url: Type.String({ description: "Public URL, for example https://abc123.trycloudflare.com" }),
 		}),
 		async execute(_toolCallId, params) {
 			const url = await setPublicUrl(params.url);
@@ -575,11 +616,11 @@ export default function relayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("relay_set_url", {
-		description: "Set this relay's public ngrok URL",
+		description: "Set this relay's public tunnel URL",
 		handler: async (args, ctx) => {
 			const url = args.trim().replace(/\/$/, "");
 			if (!/^https?:\/\//.test(url)) {
-				ctx.ui.notify("Usage: /relay_set_url <https://your-ngrok-url>", "error");
+				ctx.ui.notify("Usage: /relay_set_url <https://your-public-url>", "error");
 				return;
 			}
 			const cfg = await getConfig();
