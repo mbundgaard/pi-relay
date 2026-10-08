@@ -12,17 +12,26 @@ From this repo:
 pi --extension ./src/index.ts
 ```
 
-## Commands
+## Agent tools
+
+The extension gives the agent tools so you can ask it naturally, e.g. “start relay”, “set my relay URL to …”, “send this to the other Pi”.
+
+Available tools:
 
 ```text
-/relay_start [port]
-/relay_set_url <ngrok-url>
-/relay_show_details [ngrok-url]
-/relay_accept <pi-relay-card> <6-digit-code>
-/relay_send <message>
-/relay_status
-/relay_disconnect
+relay_prepare
+relay_start
+relay_set_url
+relay_show_details
+relay_accept
+relay_send
+relay_status
+relay_disconnect
 ```
+
+For the simple flow, just ask: “start the relay”. The agent should use `relay_prepare`. It starts the local relay, auto-detects an already-running ngrok tunnel if possible, and gives you the exact line to paste into the other Pi session. It does not start ngrok itself.
+
+Slash commands with the same names except `relay_prepare` are also registered for manual use, but they are optional.
 
 ## Handshake
 

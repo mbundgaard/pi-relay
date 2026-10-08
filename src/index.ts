@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -259,6 +260,33 @@ async function stopServer() {
 	await new Promise<void>((resolve) => s.close(() => resolve()));
 }
 
+async function detectNgrokUrl(): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		const req = httpRequest("http://127.0.0.1:4040/api/tunnels", { method: "GET", timeout: 1000 }, (res) => {
+			let data = "";
+			res.setEncoding("utf8");
+			res.on("data", (d) => (data += d));
+			res.on("end", () => {
+				try {
+					const parsed = JSON.parse(data);
+					const tunnels = Array.isArray(parsed.tunnels) ? parsed.tunnels : [];
+					const tunnel = tunnels.find((t: any) => typeof t.public_url === "string" && t.public_url.startsWith("https://")) ??
+						tunnels.find((t: any) => typeof t.public_url === "string");
+					resolve(tunnel?.public_url?.replace(/\/$/, ""));
+				} catch {
+					resolve(undefined);
+				}
+			});
+		});
+		req.on("error", () => resolve(undefined));
+		req.on("timeout", () => {
+			req.destroy();
+			resolve(undefined);
+		});
+		req.end();
+	});
+}
+
 async function postMessage(peer: Peer, message: RelayMessage) {
 	const endpoint = new URL("/message", peer.url.replace(/\/$/, ""));
 	const body = JSON.stringify(message);
@@ -303,6 +331,98 @@ function extractTextFromLastAssistant(ctx: ExtensionContext, afterMs: number): s
 
 let piApi: ExtensionAPI | undefined;
 
+function toolText(text: string, details: unknown = undefined) {
+	return { content: [{ type: "text" as const, text }], details };
+}
+
+async function setPublicUrl(url: string) {
+	const normalized = url.trim().replace(/\/$/, "");
+	if (!/^https?:\/\//.test(normalized)) throw new Error("URL must start with http:// or https://");
+	const cfg = await getConfig();
+	cfg.url = normalized;
+	await saveConfig(cfg);
+	return normalized;
+}
+
+async function createInvite(maybeUrl?: string) {
+	if (maybeUrl?.trim()) await setPublicUrl(maybeUrl);
+	const cfg = await getConfig();
+	const pairingCode = sixDigits();
+	cfg.pendingInvite = {
+		pairingCode,
+		createdAt: nowIso(),
+		expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+	};
+	await saveConfig(cfg);
+	const card = await makeLocalCard();
+	const acceptLine = `/relay_accept ${encodeCard(card)} ${pairingCode}`;
+	return { acceptLine, pairingCode, card };
+}
+
+async function acceptPeer(cardText: string, pairingCode: string) {
+	const peer = decodeCard(cardText);
+	await savePeer(peer);
+	const localCard = await makeLocalCard();
+	await postMessage(peer, {
+		id: msgId(),
+		type: "contact_card",
+		from: localCard.name,
+		pairingCode,
+		card: localCard,
+		sentAt: nowIso(),
+	});
+	return peer;
+}
+
+async function sendToPeer(text: string) {
+	const peer = await getPeer();
+	if (!peer) throw new Error("No pi-relay peer configured. Accept a contact card first.");
+	const cfg = await getConfig();
+	const message = { id: msgId(), type: "user_message" as const, from: cfg.name, text, sentAt: nowIso() };
+	await postMessage(peer, message);
+	return { peer, message };
+}
+
+async function prepareRelay(url?: string) {
+	const started = await startServer();
+	const publicUrl = url?.trim() ? await setPublicUrl(url) : (await detectNgrokUrl()) ?? undefined;
+	if (publicUrl && !url?.trim()) await setPublicUrl(publicUrl);
+	if (!publicUrl) {
+		return {
+			ready: false,
+			text: [
+				`Local relay is ${started.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${started.port}.`,
+				"I still need your public ngrok URL.",
+				"Run this in another terminal:",
+				`ngrok http ${started.port}`,
+				"Then tell me: set relay URL to <the https ngrok URL> and show my relay details.",
+			].join("\n"),
+		};
+	}
+	const invite = await createInvite(publicUrl);
+	return {
+		ready: true,
+		text: [
+			`Local relay is ${started.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${started.port}.`,
+			`Public URL: ${publicUrl}`,
+			"Paste this into the other Pi session:",
+			invite.acceptLine,
+		].join("\n"),
+		invite,
+	};
+}
+
+async function getStatusText() {
+	const cfg = await getConfig();
+	const peer = await getPeer();
+	return [
+		`server: ${server ? `running on 127.0.0.1:${cfg.port}` : "stopped"}`,
+		`public URL: ${cfg.url ?? "not set"}`,
+		`peer: ${peer ? `${peer.name} <${peer.url}>` : "none"}`,
+		`pending invite: ${cfg.pendingInvite ? cfg.pendingInvite.pairingCode : "none"}`,
+	].join("\n");
+}
+
 export default function relayExtension(pi: ExtensionAPI) {
 	piApi = pi;
 
@@ -334,6 +454,111 @@ export default function relayExtension(pi: ExtensionAPI) {
 		lastSentAssistantFor = pendingReplyTo.messageId;
 		pendingReplyTo = undefined;
 		ctx.ui.notify("pi-relay sent assistant reply", "info");
+	});
+
+	pi.registerTool({
+		name: "relay_prepare",
+		label: "Relay Prepare",
+		description: "Do the simple 'start relay' flow: start the local relay, auto-detect ngrok if it is already running, and return the exact line to paste into the other Pi. Does not start ngrok.",
+		parameters: Type.Object({
+			url: Type.Optional(Type.String({ description: "Optional public ngrok URL if already known" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			currentContext = ctx;
+			const result = await prepareRelay(params.url);
+			return toolText(result.text, result);
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_start",
+		label: "Relay Start",
+		description: "Start the local pi-relay HTTP server on 127.0.0.1. Does not start ngrok.",
+		parameters: Type.Object({
+			port: Type.Optional(Type.Number({ description: "Local port, defaults to 8787" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			currentContext = ctx;
+			const port = params.port;
+			if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error("Invalid port");
+			const result = await startServer(port);
+			return toolText(`pi-relay ${result.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${result.port}`, result);
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_set_url",
+		label: "Relay Set URL",
+		description: "Set this relay's public ngrok URL after the user has started ngrok manually.",
+		parameters: Type.Object({
+			url: Type.String({ description: "Public URL, for example https://abc123.ngrok-free.app" }),
+		}),
+		async execute(_toolCallId, params) {
+			const url = await setPublicUrl(params.url);
+			return toolText(`pi-relay public URL set to ${url}`, { url });
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_show_details",
+		label: "Relay Show Details",
+		description: "Create a contact card and 6-digit pairing code for the other Pi. Returns a copy/paste accept line.",
+		parameters: Type.Object({
+			url: Type.Optional(Type.String({ description: "Optional public URL to set first" })),
+		}),
+		async execute(_toolCallId, params) {
+			const invite = await createInvite(params.url);
+			return toolText(`Share this with the other Pi:\n${invite.acceptLine}`, invite);
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_accept",
+		label: "Relay Accept",
+		description: "Accept a pi-relay contact card plus 6-digit code, store that peer, and send this side's return contact card.",
+		parameters: Type.Object({
+			card: Type.String({ description: "pi-relay:// contact card" }),
+			pairingCode: Type.String({ description: "6-digit pairing code from the other Pi" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			currentContext = ctx;
+			const peer = await acceptPeer(params.card, params.pairingCode);
+			return toolText(`Accepted ${peer.name} and sent return contact card`, { peerName: peer.name, peerUrl: peer.url });
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_send",
+		label: "Relay Send",
+		description: "Send a text message to the paired Pi relay.",
+		parameters: Type.Object({
+			message: Type.String({ description: "Message to send" }),
+		}),
+		async execute(_toolCallId, params) {
+			const { peer, message } = await sendToPeer(params.message);
+			return toolText(`Sent to ${peer.name}`, { peerName: peer.name, messageId: message.id });
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_status",
+		label: "Relay Status",
+		description: "Show pi-relay server, URL, peer, and pending invite status.",
+		parameters: Type.Object({}),
+		async execute() {
+			return toolText(await getStatusText());
+		},
+	});
+
+	pi.registerTool({
+		name: "relay_disconnect",
+		label: "Relay Disconnect",
+		description: "Forget the current pi-relay peer.",
+		parameters: Type.Object({}),
+		async execute() {
+			if (existsSync(PEER_PATH)) await rm(PEER_PATH);
+			return toolText("pi-relay peer removed");
+		},
 	});
 
 	pi.registerCommand("relay_start", {
