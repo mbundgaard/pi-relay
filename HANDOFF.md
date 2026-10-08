@@ -1,4 +1,6 @@
-# pi-relay handoff
+# pi-relay handoff (historical design)
+
+Superseded by `README.md` and the extension implementation. The current transport uses account-free quick tunnels, not ngrok. Both `relay_start` and `relay_accept` handle startup automatically. The pairing prompt is a compact relay link plus a code; no standalone Pi RPC process is used.
 
 ## Goal
 

@@ -1,58 +1,47 @@
 # pi-relay
 
-One-to-one async Pi-to-Pi relay implemented as a Pi extension.
+A one-to-one async link between two Pi agents.
 
-Loading the extension only registers tools. When you ask the agent to start the relay, it starts the local relay and opens a free Cloudflare quick tunnel automatically.
+## Install on both hosts
 
-## Load
-
-From this repo:
-
-```bash
-pi --extension ./src/index.ts
+```sh
+pi install git:github.com/mbundgaard/pi-relay
 ```
 
-## Simple use
+For a local checkout: `npm install`, then `pi install .`.
+Use `/reload` in an already-running Pi session after installing or updating.
 
-Ask the agent:
+## Use
+
+Tell your agent **start relay**. It returns just:
 
 ```text
-start relay
+relay_accept https://<host>#<secret> <code>
 ```
 
-It should call `relay_start` and return exactly one line like:
+Paste that line into the other agent. Its `relay_accept` tool starts its own relay, opens its tunnel, and returns its contact information automatically. No separate startup, ports, accounts, or URLs to configure.
 
-```text
-/relay_accept pi-relay://... 123456
+Then ask either agent to send a message to the other.
+
+The link contains a secret: share it only with the intended peer. Pairing codes expire after 30 minutes.
+
+## Behavior
+
+- Loading the extension starts no network listeners or processes.
+- Startup automatically downloads the tunnel binary if missing and opens an account-free Cloudflare Quick Tunnel.
+- Startup waits for public reachability before returning the pairing line.
+- No ngrok dependency, authentication, or port-4040 discovery remains.
+- Shutdown closes the local listener and the tunnel process owned by this extension.
+- `relay_start`, `relay_accept`, `relay_send`, `relay_status`, and `relay_disconnect` are agent tools. Legacy helper tools and slash commands remain available.
+- State lives in `~/.pi-relay/`. The current prototype supports one active relay per state directory. Tests use `PI_RELAY_STATE_DIR` for isolation.
+- Tunnel URLs are temporary; start and pair again after restarting Pi.
+- Inbound requests trigger Pi work; assistant replies are returned as notifications rather than triggering an endless reply loop.
+
+## Checks
+
+```sh
+npm run check
+npm run test:live
 ```
 
-Paste that line into the remote Pi session. That is the pairing prompt.
-
-On the remote side, ask its agent to start relay too if needed, then paste the line. The remote side sends its return contact card back automatically.
-
-Then either side can ask its agent to send something to the other Pi.
-
-## Agent tools
-
-```text
-relay_start
-relay_prepare
-relay_accept
-relay_send
-relay_status
-relay_disconnect
-relay_set_url
-relay_show_details
-```
-
-Slash commands with similar names are also registered for manual use, but normal use should be through agent tools.
-
-## State
-
-State is stored in `~/.pi-relay/`:
-
-```text
-config.json
-peer.json
-messages.jsonl
-```
+The live test launches two isolated relays with real public tunnels and verifies compact invites, reachability, authentication, rejected pairing codes, automatic remote startup, bidirectional message delivery, and repeated startup. It requires internet access and cleans up its processes and temporary state.

@@ -3,7 +3,8 @@ import { Type } from "typebox";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
+import { bin as tunnelBinary, install as installTunnelBinary } from "cloudflared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readFile, writeFile, appendFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -12,7 +13,7 @@ import path from "node:path";
 
 const VERSION = 1;
 const DEFAULT_PORT = 8787;
-const STATE_DIR = path.join(os.homedir(), ".pi-relay");
+const STATE_DIR = process.env.PI_RELAY_STATE_DIR ?? path.join(os.homedir(), ".pi-relay");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const PEER_PATH = path.join(STATE_DIR, "peer.json");
 const MESSAGES_PATH = path.join(STATE_DIR, "messages.jsonl");
@@ -60,7 +61,7 @@ let lastSentAssistantFor: string | undefined;
 const nowIso = () => new Date().toISOString();
 const msgId = () => `msg_${randomBytes(12).toString("hex")}`;
 const token = () => `rly_${randomBytes(24).toString("base64url")}`;
-const sixDigits = () => String(Math.floor(100000 + Math.random() * 900000));
+const sixDigits = () => String(randomInt(100000, 1000000));
 
 async function ensureStateDir() {
 	await mkdir(STATE_DIR, { recursive: true });
@@ -105,12 +106,16 @@ async function savePeer(peer: Peer) {
 	await writeJson(PEER_PATH, peer);
 }
 
-function encodeCard(card: ContactCard): string {
-	return `pi-relay://${Buffer.from(JSON.stringify(card), "utf8").toString("base64url")}`;
-}
-
 function decodeCard(input: string): ContactCard {
 	const trimmed = input.trim();
+	if (trimmed.startsWith("https://")) {
+		const url = new URL(trimmed);
+		const secret = url.hash.slice(1);
+		if (!/^rly_[A-Za-z0-9_-]{32}$/.test(secret)) throw new Error("Invalid relay link secret");
+		url.hash = "";
+		return { kind: "pi-relay-contact", version: 1, name: url.hostname, url: url.origin,
+			token: secret, createdAt: nowIso(), capabilities: ["one-to-one", "async-messages"] };
+	}
 	if (!trimmed.startsWith("pi-relay://")) throw new Error("contact card must start with pi-relay://");
 	const json = Buffer.from(trimmed.slice("pi-relay://".length), "base64url").toString("utf8");
 	const card = JSON.parse(json) as ContactCard;
@@ -137,7 +142,9 @@ async function makeLocalCard(): Promise<ContactCard> {
 
 async function appendMessage(direction: "in" | "out", message: RelayMessage) {
 	await ensureStateDir();
-	const safe = { direction, receivedAt: nowIso(), ...message };
+	const { card, pairingCode: _code, ...metadata } = message;
+	const safe = { direction, receivedAt: nowIso(), ...metadata,
+		...(card ? { card: { name: card.name, url: card.url } } : {}) };
 	await appendFile(MESSAGES_PATH, `${JSON.stringify(safe)}\n`, "utf8");
 }
 
@@ -165,8 +172,8 @@ function bearer(req: IncomingMessage): string | undefined {
 	return auth.slice("Bearer ".length).trim();
 }
 
-async function handleInboundMessage(message: RelayMessage) {
-	await appendMessage("in", message);
+async function handleInboundMessage(message: RelayMessage, logged = false) {
+	if (!logged) await appendMessage("in", message);
 	const ctx = currentContext;
 
 	if (message.type === "contact_card") {
@@ -226,12 +233,24 @@ async function startServer(port?: number) {
 					return;
 				}
 				const body = (await readBody(req)) as RelayMessage;
+				if (body.type === "contact_card" && (!c.pendingInvite ||
+					body.pairingCode !== c.pendingInvite.pairingCode ||
+					Date.parse(c.pendingInvite.expiresAt) <= Date.now())) {
+					sendJson(res, 403, { ok: false, error: "Invalid or expired pairing code" });
+					return;
+				}
 				if (!body?.id || !body?.type || !body?.sentAt) {
 					sendJson(res, 400, { ok: false, error: "invalid message" });
 					return;
 				}
+				if (body.type === "contact_card") {
+					await handleInboundMessage(body);
+					sendJson(res, 200, { ok: true, id: body.id, status: "accepted" });
+					return;
+				}
+				await appendMessage("in", body);
 				sendJson(res, 200, { ok: true, id: body.id, status: "accepted" });
-				void handleInboundMessage(body).catch((err: any) =>
+				void handleInboundMessage(body, true).catch((err: any) =>
 					currentContext?.ui.notify(`pi-relay inbound error: ${err?.message ?? err}`, "error"),
 				);
 				return;
@@ -243,13 +262,18 @@ async function startServer(port?: number) {
 		}
 	});
 
-	await new Promise<void>((resolve, reject) => {
-		server!.once("error", reject);
-		server!.listen(listenPort, "127.0.0.1", () => {
-			server!.off("error", reject);
-			resolve();
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server!.once("error", reject);
+			server!.listen(listenPort, "127.0.0.1", () => {
+				server!.off("error", reject);
+				resolve();
+			});
 		});
-	});
+	} catch (error) {
+		server = undefined;
+		throw error;
+	}
 	cfg.port = listenPort;
 	await saveConfig(cfg);
 	return { alreadyRunning: false, port: listenPort };
@@ -260,33 +284,6 @@ async function stopServer() {
 	const s = server;
 	server = undefined;
 	await new Promise<void>((resolve) => s.close(() => resolve()));
-}
-
-async function detectNgrokUrl(): Promise<string | undefined> {
-	return new Promise((resolve) => {
-		const req = httpRequest("http://127.0.0.1:4040/api/tunnels", { method: "GET", timeout: 1000 }, (res) => {
-			let data = "";
-			res.setEncoding("utf8");
-			res.on("data", (d) => (data += d));
-			res.on("end", () => {
-				try {
-					const parsed = JSON.parse(data);
-					const tunnels = Array.isArray(parsed.tunnels) ? parsed.tunnels : [];
-					const tunnel = tunnels.find((t: any) => typeof t.public_url === "string" && t.public_url.startsWith("https://")) ??
-						tunnels.find((t: any) => typeof t.public_url === "string");
-					resolve(tunnel?.public_url?.replace(/\/$/, ""));
-				} catch {
-					resolve(undefined);
-				}
-			});
-		});
-		req.on("error", () => resolve(undefined));
-		req.on("timeout", () => {
-			req.destroy();
-			resolve(undefined);
-		});
-		req.end();
-	});
 }
 
 async function postMessage(peer: Peer, message: RelayMessage) {
@@ -310,6 +307,7 @@ async function postMessage(peer: Peer, message: RelayMessage) {
 				else reject(new Error(`HTTP ${res.statusCode}: ${data}`));
 			});
 		});
+		req.setTimeout(20000, () => req.destroy(new Error("Peer request timed out")));
 		req.on("error", reject);
 		req.write(body);
 		req.end();
@@ -357,13 +355,14 @@ async function createInvite(maybeUrl?: string) {
 	};
 	await saveConfig(cfg);
 	const card = await makeLocalCard();
-	const acceptLine = `/relay_accept ${encodeCard(card)} ${pairingCode}`;
+	const acceptLine = `relay_accept ${card.url}#${card.token} ${pairingCode}`;
 	return { acceptLine, pairingCode, card };
 }
 
 async function acceptPeer(cardText: string, pairingCode: string) {
 	const peer = decodeCard(cardText);
-	await savePeer(peer);
+	if (!/^\d{6}$/.test(pairingCode)) throw new Error("Expected six-digit pairing code");
+	await ensureRelay();
 	const localCard = await makeLocalCard();
 	await postMessage(peer, {
 		id: msgId(),
@@ -373,6 +372,7 @@ async function acceptPeer(cardText: string, pairingCode: string) {
 		card: localCard,
 		sentAt: nowIso(),
 	});
+	await savePeer(peer);
 	return peer;
 }
 
@@ -391,8 +391,9 @@ async function startCloudflareTunnel(port: number): Promise<string> {
 		if (cfg.url) return cfg.url;
 	}
 
+	if (!existsSync(tunnelBinary)) await installTunnelBinary(tunnelBinary);
 	return new Promise((resolve, reject) => {
-		const proc = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+		const proc = spawn(tunnelBinary, ["tunnel", "--url", `http://127.0.0.1:${port}`], {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		tunnelProcess = proc;
@@ -408,9 +409,9 @@ async function startCloudflareTunnel(port: number): Promise<string> {
 
 		const onData = (chunk: Buffer) => {
 			const text = chunk.toString("utf8");
-			output += text;
+			output = (output + text).slice(-16384);
 			const match = output.match(/https:\/\/[^\s|]+\.trycloudflare\.com/);
-			if (match && !settled) {
+			if (match && output.includes("Registered tunnel connection") && !settled) {
 				settled = true;
 				clearTimeout(timeout);
 				resolve(match[0].replace(/\/$/, ""));
@@ -420,6 +421,7 @@ async function startCloudflareTunnel(port: number): Promise<string> {
 		proc.stdout.on("data", onData);
 		proc.stderr.on("data", onData);
 		proc.on("error", (err) => {
+			if (tunnelProcess === proc) tunnelProcess = undefined;
 			if (!settled) {
 				settled = true;
 				clearTimeout(timeout);
@@ -427,6 +429,7 @@ async function startCloudflareTunnel(port: number): Promise<string> {
 			}
 		});
 		proc.on("exit", (code) => {
+			if (tunnelProcess === proc) tunnelProcess = undefined;
 			if (!settled) {
 				settled = true;
 				clearTimeout(timeout);
@@ -436,10 +439,35 @@ async function startCloudflareTunnel(port: number): Promise<string> {
 	});
 }
 
+let starting: Promise<string> | undefined;
+async function ensureRelay(): Promise<string> {
+	if (starting) return starting;
+	starting = (async () => {
+		const started = await startServer();
+		const url = await startCloudflareTunnel(started.port);
+		let reachable = false;
+		for (let attempt = 0; attempt < 30; attempt++) {
+			try {
+				const response = await fetch(`${url}/info`, { signal: AbortSignal.timeout(5000) });
+				const info = await response.json() as { kind?: string };
+				if (response.ok && info.kind === "pi-relay") { reachable = true; break; }
+			} catch { /* DNS and routing may take time to propagate. */ }
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+		if (!reachable) {
+			tunnelProcess?.kill();
+			tunnelProcess = undefined;
+			throw new Error("Relay tunnel did not become reachable; retry relay_start.");
+		}
+		await setPublicUrl(url);
+		return url;
+	})();
+	try { return await starting; } finally { starting = undefined; }
+}
+
 async function prepareRelay(url?: string) {
-	const started = await startServer();
-	const publicUrl = url?.trim() ? await setPublicUrl(url) : await startCloudflareTunnel(started.port);
-	if (!publicUrl) throw new Error("Could not start public tunnel or get public URL");
+	if (url) await startServer();
+	const publicUrl = url ? await setPublicUrl(url) : await ensureRelay();
 	const invite = await createInvite(publicUrl);
 	return {
 		ready: true,
@@ -548,16 +576,16 @@ export default function relayExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params) {
 			const invite = await createInvite(params.url);
-			return toolText(`Share this with the other Pi:\n${invite.acceptLine}`, invite);
+			return toolText(invite.acceptLine, invite);
 		},
 	});
 
 	pi.registerTool({
 		name: "relay_accept",
 		label: "Relay Accept",
-		description: "Accept a pi-relay contact card plus 6-digit code, store that peer, and send this side's return contact card.",
+		description: "Accept a relay link and six-digit code. Automatically start this side, open its tunnel, and send return contact info. No separate relay_start is needed.",
 		parameters: Type.Object({
-			card: Type.String({ description: "pi-relay:// contact card" }),
+			card: Type.String({ description: "Relay link (https://host#secret), or legacy pi-relay:// card. Automatically starts this side before pairing." }),
 			pairingCode: Type.String({ description: "6-digit pairing code from the other Pi" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -602,16 +630,11 @@ export default function relayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("relay_start", {
-		description: "Start the local pi-relay HTTP server on 127.0.0.1",
+		description: "Start the relay end-to-end and show its pairing line",
 		handler: async (args, ctx) => {
 			currentContext = ctx;
-			const port = args.trim() ? Number(args.trim()) : undefined;
-			if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
-				ctx.ui.notify("Usage: /relay_start [port]", "error");
-				return;
-			}
-			const result = await startServer(port);
-			ctx.ui.notify(`pi-relay ${result.alreadyRunning ? "already running" : "started"} on 127.0.0.1:${result.port}`, "info");
+			const result = await prepareRelay();
+			ctx.ui.notify(result.text, "info");
 		},
 	});
 
@@ -633,22 +656,8 @@ export default function relayExtension(pi: ExtensionAPI) {
 	pi.registerCommand("relay_show_details", {
 		description: "Show copy/paste pairing command for another Pi",
 		handler: async (args, ctx) => {
-			const maybeUrl = args.trim();
-			if (maybeUrl) {
-				const cfg = await getConfig();
-				cfg.url = maybeUrl.replace(/\/$/, "");
-				await saveConfig(cfg);
-			}
-			const cfg = await getConfig();
-			const pairingCode = sixDigits();
-			cfg.pendingInvite = {
-				pairingCode,
-				createdAt: nowIso(),
-				expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-			};
-			await saveConfig(cfg);
-			const card = await makeLocalCard();
-			ctx.ui.notify(`Share this with the other Pi:\n/relay_accept ${encodeCard(card)} ${pairingCode}`, "info");
+			const invite = await createInvite(args.trim() || undefined);
+			ctx.ui.notify(invite.acceptLine, "info");
 		},
 	});
 
@@ -658,20 +667,10 @@ export default function relayExtension(pi: ExtensionAPI) {
 			currentContext = ctx;
 			const [cardArg, pairingCode] = args.trim().split(/\s+/, 2);
 			if (!cardArg || !pairingCode) {
-				ctx.ui.notify("Usage: /relay_accept pi-relay://<card> <6-digit-code>", "error");
+				ctx.ui.notify("Usage: /relay_accept <relay-link> <6-digit-code>", "error");
 				return;
 			}
-			const peer = decodeCard(cardArg);
-			await savePeer(peer);
-			const localCard = await makeLocalCard();
-			await postMessage(peer, {
-				id: msgId(),
-				type: "contact_card",
-				from: localCard.name,
-				pairingCode,
-				card: localCard,
-				sentAt: nowIso(),
-			});
+			const peer = await acceptPeer(cardArg, pairingCode);
 			ctx.ui.notify(`Accepted ${peer.name} and sent return contact card`, "info");
 		},
 	});
