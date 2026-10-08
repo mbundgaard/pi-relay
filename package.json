@@ -1,0 +1,18 @@
+{
+  "name": "pi-relay",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "One-to-one async Pi relay extension",
+  "main": "src/index.ts",
+  "pi": {
+    "extension": "src/index.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}
