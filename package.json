@@ -1,16 +1,29 @@
 {
-  "name": "pi-relay",
-  "version": "0.1.0",
+  "name": "@comput/pi-relay",
+  "version": "0.1.1",
   "type": "module",
-  "private": true,
+  "publishConfig": { "access": "public" },
   "description": "One-to-one async Pi relay extension",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "relay"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mbundgaard/pi-relay.git"
+  },
+  "homepage": "https://github.com/mbundgaard/pi-relay#readme",
+  "bugs": {
+    "url": "https://github.com/mbundgaard/pi-relay/issues"
+  },
+  "files": ["src/index.ts", "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "docs/"],
   "main": "src/index.ts",
   "pi": {
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
     "check": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --types node src/index.ts",
-    "test:live": "tsx tests/live.ts"
+    "test:live": "tsx tests/live.ts",
+    "prepack": "npm run check",
+    "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

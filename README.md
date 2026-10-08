@@ -37,6 +37,29 @@ The link contains a secret: share it only with the intended peer. Pairing codes 
 - Tunnel URLs are temporary; start and pair again after restarting Pi.
 - Inbound requests trigger Pi work; assistant replies are returned as notifications rather than triggering an endless reply loop.
 
+## Troubleshooting
+
+Repeated `getaddrinfo ENOTFOUND ...trycloudflare.com` errors usually mean a
+saved peer tunnel has expired. Run `/relay_disconnect`, then start and pair
+again with a fresh link. This does not revoke the local token or stop the tunnel.
+See [known issues](docs/KNOWN_ISSUES.md) for the outstanding reply-handling bug.
+
+## Package preparation
+
+The npm package is `@comput/pi-relay`, licensed under [MIT](LICENSE).
+Install with `pi install npm:@comput/pi-relay`.
+This is a prototype; review [known issues](docs/KNOWN_ISSUES.md) before use.
+
+```sh
+npm ci
+npm run pack:check
+npm pack
+```
+
+Pi loads the packaged TypeScript extension directly; no bundle is needed.
+See [release instructions](docs/RELEASING.md), [security notes](SECURITY.md),
+and [changelog](CHANGELOG.md). `HANDOFF.md` is historical, not the current spec.
+
 ## Checks
 
 ```sh
